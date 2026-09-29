@@ -1,4 +1,4 @@
-/*! studio-tokps-overlay.js  v2
+/*! tokps-overlay.js  v3.3.1  (studio-tokps)
  *  Ekko Studio 本地补丁：把事件流里的运行信息全部摊开显示
  *   - 实时：输出速度(tok/s)、首 token、状态(思考/生成/调用工具/授权/压缩/子代理/完成)、当前工具与已耗时
  *   - 本轮：模型用时、工具用时、API 调用次数、输出 token、速率曲线(最近 60s)
