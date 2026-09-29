@@ -65,6 +65,31 @@ Windows 直接双击 `studio-tokps.cmd`（等价于 `launch`，支持同样参�
 
 **精度说明**：Studio 部分版本的后端不上报计时，所以实时值属**估算**（面板底部有标注）；实测值来自 `usage`，与官方统计口径一致。
 
+
+## 官方 usage 接入（v3.4）
+
+浮标除了嗅探事件流，还会读 Studio 自己的会话接口（同一进程内发请求，带应用自身凭据）：
+
+```
+GET /api/studio/sessions/:id      → { session: { input_tokens, output_tokens, cache_read_tokens,
+                                                 cache_write_tokens, reasoning_tokens,
+                                                 message_count, tool_call_count,
+                                                 started_at, ended_at, model, … } }
+GET /api/studio/sessions/:id/usage → 最近一条 usage 行（token 明细）
+```
+
+由此得到**真实**数值（不再是估算）：
+
+| 显示项 | 算式 |
+|---|---|
+| 官方 usage 区块 | 直接来自会话行：输入/输出/缓存读/写/推理/message_count/tool_call_count/模型 |
+| 缓存命中率（真实） | `cache_read_tokens / (input_tokens + cache_read_tokens)` |
+| 会话时长 / 平均 TPS | `output_tokens ÷ (ended_at − started_at)`（含工具等待，所以会明显低于瞬时速度，面板里标注为「平均」，浮标上带「平均」前缀） |
+| 实测速度（本轮·接口口径） | `(本轮结束时的 output_tokens − 本轮开始时的 output_tokens) ÷ 事件流测得的模型用时` |
+
+**这对"运行时不上报 usage 事件"的版本尤其有用**：以前那种情况只能显示估算值，现在有真实 token 兜底。
+读取失败（未登录 / 接口变化）时面板会明确写「未接入（原因）」，并回退到事件流统计。
+
 ## 自检
 
 ```bash

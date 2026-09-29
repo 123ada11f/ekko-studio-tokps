@@ -137,5 +137,42 @@ check('失败数 = 1', st.stepFails, 1);
 check('工具用时 ≈ 500ms', Math.round(st.toolMs), 500);
 check('常用工具统计', st.toolCounts.bash, 1);
 
+/* ---------- 6) 官方 usage（会话接口）接入：真实 token + 平均 TPS + 本轮接口口径 ---------- */
+const sidR = 'realUsage';
+clock.t = 5000; api.handle('run.started', { session_id: sidR });
+check('run.started 后尚未有接口数据', api.state[sidR].real.ok, false);
+clock.t = 5500; api.handle('message.delta', { session_id: sidR, delta: CJK });   /* 建立一次模型调用（modelStart=5500） */
+const realPayload = (out, msgs) => ({ session: {
+  input_tokens: 5000, output_tokens: out, cache_read_tokens: 15000, cache_write_tokens: 200,
+  reasoning_tokens: 50, message_count: msgs, tool_call_count: 3,
+  started_at: 1790690000, ended_at: 1790690060, model: 'deepseek-v4.1-flash', profile: 'default' } });
+api.applySession(sidR, realPayload(1000, 8));                 /* 本轮中途首次拉到 → 记基线 */
+clock.t = 6500;
+api.applySession(sidR, realPayload(1300, 9));                 /* 之后又更新 */
+const stR = api.state[sidR];
+check('接口数据已接入', stR.real.ok, true);
+check('接口真实输入 token', stR.real['in'], 5000);
+check('接口真实输出 token', stR.real.out, 1300);
+check('接口缓存读 / 写', stR.real.cr + '/' + stR.real.cw, '15000/200');
+check('接口推理 token', stR.real.rz, 50);
+check('接口消息数 / 工具调用数', stR.real.msgs + '/' + stR.real.tools, '9/3');
+check('接口模型名', stR.real.model, 'deepseek-v4.1-flash');
+check('会话时长 = 60 秒', api.sessionSeconds(stR), 60);
+check('官方口径平均 TPS = 1300/60', api.officialAvg(stR), (v) => Math.abs(v - 1300 / 60) < 1e-6);
+check('本轮接口口径速度 = (1300-1000)/1.0s', api.realTurn(stR, stR.turn), (v) => Math.abs(v - 300) < 1e-6);
+
+/* 防御性解析：camelCase / {data}/ / 扁平 三种形态 */
+const sA = { session: { outputTokens: 10, inputTokens: 5, startedAt: 100, endedAt: 110 } };
+const sB = { data: { output_tokens: 20, input_tokens: 6, started_at: 100, ended_at: 120 } };
+const sC = { output_tokens: 30, input_tokens: 7, started_at: 100, ended_at: 130 };
+[
+  ['camelCase', sA, 10], ['{data} 包装', sB, 20], ['扁平对象', sC, 30],
+].forEach(([label, payload, want]) => {
+  const sid = 'shape' + label.length;
+  api.handle('run.started', { session_id: sid });
+  api.applySession(sid, payload);
+  check(`接口形态 ${label} → 输出 token`, api.state[sid].real.out, want);
+});
+
 console.log(`\n${TOTAL - FAILED}/${TOTAL} 通过` + (FAILED ? `，${FAILED} 项失败` : '，全部通过'));
 process.exit(FAILED ? 1 : 0);

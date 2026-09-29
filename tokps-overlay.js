@@ -1,4 +1,4 @@
-/*! tokps-overlay.js  v3.3.1  (studio-tokps)
+/*! tokps-overlay.js  v3.4.0  (studio-tokps)
  *  Ekko Studio 本地补丁：把事件流里的运行信息全部摊开显示
  *   - 实时：输出速度(tok/s)、首 token、状态(思考/生成/调用工具/授权/压缩/子代理/完成)、当前工具与已耗时
  *   - 本轮：模型用时、工具用时、API 调用次数、输出 token、速率曲线(最近 60s)
@@ -28,6 +28,8 @@
       s = sessions[id] = {
         id: id, cum: 0, cumIn: 0, cumOut: 0, cumCacheRead: 0, cumCacheWrite: 0, cumReasoning: 0,
         apiCalls: 0, ctxTokens: 0, ctxLimit: 0, ctxAsked: false, usageAsked: false,
+        real: { ok: false, err: '', at: 0, in: 0, out: 0, cr: 0, cw: 0, rz: 0, msgs: 0, tools: 0,
+                start: 0, end: 0, model: '', profile: '' }, realFetchedAt: 0, realPending: false,
         turns: 0, steps: 0, stepFails: 0, toolCounts: {}, toolMs: 0,
         curTool: null, curToolStart: null, subActive: 0, subDone: [], subTokens: 0,
         status: 'idle', statusAt: Date.now(), turn: null, history: [], samples: []
@@ -40,14 +42,91 @@
   function newTurn(at, base) {
     return { idx: 0, t0: at, base: base, out: 0, modelMs: 0, toolMs: 0, modelStart: null, toolStart: null,
              ttft: null, calls: [], apiCalls: 0, done: false, totalMs: null, startedAt: Date.now(),
-             tools: [], boundary: at, lastCum: base, estTotal: 0, estWindowStart: at, lastChunkAt: 0, calib: 1 };
+             tools: [], boundary: at, lastCum: base, estTotal: 0, estWindowStart: at, lastChunkAt: 0, calib: 1,
+             realBase: null, realOut: 0 };
   }
   function active(s) { return (s.turn && !s.turn.done) ? s.turn : null; }
   function setStatus(s, st) { if (s.status !== st) { s.status = st; s.statusAt = Date.now(); } }
 
+  /* ---------- 官方 usage：解析 GET /api/studio/sessions/:id 的会话行 ---------- */
+  function numOf(o, keys) {
+    for (var i = 0; i < keys.length; i++) {
+      var v = o ? o[keys[i]] : undefined;
+      if (v !== undefined && v !== null && isFinite(Number(v))) return Number(v);
+    }
+    return 0;
+  }
+  /* payload 形如 {session:{input_tokens,output_tokens,cache_read_tokens,...,started_at,ended_at}} */
+  function applySessionPayload(s, payload) {
+    if (!s) return null;
+    if (!s.real) { s.real = { ok: false, err: '', at: 0, in: 0, out: 0, cr: 0, cw: 0, rz: 0, msgs: 0, tools: 0, start: 0, end: 0, model: '', profile: '' }; }
+    var row = (payload && (payload.session || payload.data || payload)) || null;
+    if (!row || typeof row !== 'object') { s.real.err = 'empty'; return s.real; }
+    var out = numOf(row, ['output_tokens', 'outputTokens']);
+    var cin = numOf(row, ['input_tokens', 'inputTokens']);
+    if (!out && !cin && !numOf(row, ['message_count', 'messageCount'])) { s.real.err = 'no-fields'; return s.real; }
+    s.real.ok = true; s.real.err = '';
+    s.real.at = Date.now();
+    s.real.out = out;
+    s.real['in'] = cin;
+    s.real.cr = numOf(row, ['cache_read_tokens', 'cacheReadTokens']);
+    s.real.cw = numOf(row, ['cache_write_tokens', 'cacheWriteTokens']);
+    s.real.rz = numOf(row, ['reasoning_tokens', 'reasoningTokens']);
+    s.real.msgs = numOf(row, ['message_count', 'messageCount']);
+    s.real.tools = numOf(row, ['tool_call_count', 'toolCallCount']);
+    s.real.start = numOf(row, ['started_at', 'startedAt']);
+    s.real.end = numOf(row, ['ended_at', 'endedAt']);
+    s.real.model = String(row.model || '');
+    s.real.profile = String(row.profile || '');
+    if (s.turn && !s.turn.done && s.turn.realBase === null) s.turn.realBase = out;
+    return s.real;
+  }
+  /* 会话时长（秒）：接口给的秒级时间戳 */
+  function sessionSeconds(s, at) {
+    if (!s.real.ok || !s.real.start) return null;
+    var end = s.real.end || Math.round((at || Date.now()) / 1000);
+    var d = end - s.real.start;
+    return d > 0 ? d : null;
+  }
+  /* 官方口径平均速度：真实输出 token ÷ 会话时长 */
+  function officialAvgTps(s, at) {
+    var sec = sessionSeconds(s, at);
+    if (!s.real.ok || !(s.real.out > 0) || !sec) return null;
+    return s.real.out / sec;
+  }
+  /* 本轮的接口口径实测速度：真实 token 增量 ÷ 事件测得的模型用时 */
+  function realTurnSpeed(s, tt, at) {
+    if (!tt || !s.real.ok) return null;
+    var base = (tt.realBase === null ? tt.base : tt.realBase);
+    var dout = s.real.out - base;
+    if (!(dout > 0)) return null;
+    var model = tt.modelMs + ((!tt.done && tt.modelStart !== null) ? ((at || now()) - tt.modelStart) : 0);
+    if (!(model > 0)) return null;
+    return dout / (model / 1000);
+  }
+
   /* ---------- 会话级只读补数（在应用内发请求，带应用自身凭据） ---------- */
+  function fetchSessionFacts(s, force) {
+    if (!window.fetch || s.id === 'default' || s.realPending) return;
+    var t = Date.now();
+    if (!force && (t - s.realFetchedAt) < 3000) return;
+    s.realPending = true;
+    try {
+      fetch('/api/studio/sessions/' + encodeURIComponent(s.id)).then(function (r) {
+        return r.ok ? r.json() : null;
+      }).then(function (d) {
+        s.realPending = false;
+        s.realFetchedAt = Date.now();
+        if (!d) { s.real.err = 'http'; return; }
+        applySessionPayload(s, d);
+        schedule();
+      }, function () { s.realPending = false; s.real.err = 'net'; });
+    } catch (e) { s.realPending = false; s.real.err = 'throw'; }
+  }
+
   function hydrate(s) {
     if (!window.fetch || s.id === 'default') return;
+    fetchSessionFacts(s);
     if (!s.usageAsked) {
       s.usageAsked = true;
       try {
@@ -198,6 +277,7 @@
       case 'run.queued':
         s.turns++;
         s.samples = [];
+        fetchSessionFacts(s, true);
         s.turn = newTurn(t, s.cum);
         s.turn.idx = s.turns;
         setStatus(s, 'thinking');
@@ -321,6 +401,7 @@
           }
         }
         if (isFinite(cum)) { s.cum = Math.max(s.cum, cum); s.cumOut = Math.max(s.cumOut, cum); }
+        fetchSessionFacts(s, true);
         if (name === 'run.completed') finish(s, t);
         break;
       }
@@ -566,9 +647,13 @@
     /* ---- 浮标 ---- */
     var liveParts = [];
     var streaming = !!(s.turn && !s.turn.done);
-    var estFallback = (sp === null && !live && tt) ? estSpeed(tt) : null;
+    var realTurn = (sp === null && !live && tt) ? realTurnSpeed(s, tt) : null;
+    var realAvg = (sp === null && !live && realTurn === null) ? officialAvgTps(s) : null;
+    var estFallback = (sp === null && !live && realTurn === null && realAvg === null && tt) ? estSpeed(tt) : null;
     if (live) liveParts.push('<b>~' + fmtSpeed(live.tps) + '</b> tok/s');
     else if (sp !== null) liveParts.push('<b>' + fmtSpeed(sp) + '</b> tok/s');
+    else if (realTurn !== null) liveParts.push('<b>' + fmtSpeed(realTurn) + '</b> tok/s');
+    else if (realAvg !== null) liveParts.push('平均 <b>' + fmtSpeed(realAvg) + '</b> tok/s');
     else if (estFallback !== null) liveParts.push('<b>~' + fmtSpeed(estFallback) + '</b> tok/s');
     else liveParts.push(streaming ? '计速中…' : '<b>—</b> tok/s');
     if (tt && tt.ttft !== null) liveParts.push('首字 ' + fmtSec(tt.ttft));
@@ -600,6 +685,8 @@
       h.push(row('实测速度', (measured === null ? '—' : fmtSpeed(measured) + ' tok/s') +
         (measured === null && estv !== null ? '（无 usage 数据，见估算）' : '')));
       if (measured === null && estv !== null) h.push(row('估算速度', '~' + fmtSpeed(estv) + ' tok/s · 估算 ' + fmtTok(head.estTotal) + ' tok'));
+      var rt = realTurnSpeed(s, head, liveTurn ? now() : undefined);
+      if (measured === null && rt !== null) h.push(row('实测速度（本轮·接口口径）', fmtSpeed(rt) + ' tok/s'));
       if (liveTurn && live) {
         h.push(row('实时估算', '~' + fmtSpeed(live.tps) + ' tok/s · ' + fmtTok(live.tokens) + ' tok / ' + (live.winMs / 1000).toFixed(1) + '秒窗口'));
         if (head.calib && Math.abs(head.calib - 1) > 0.02) h.push(row('估算校准', '×' + head.calib.toFixed(2) + '（实测 / 估算）'));
@@ -623,7 +710,24 @@
       }
     }
 
-    h.push('<hr><h4>Token 明细（会话累计）</h4>');
+    h.push('<hr><h4>官方 usage（会话接口）</h4>');
+    if (s.real.ok) {
+      var hitR = (s.real.cr > 0 && s.real['in'] > 0) ? (s.real.cr / (s.real['in'] + s.real.cr) * 100) : null;
+      h.push(row('输入 / 输出', fmtTok(s.real['in']) + ' / ' + fmtTok(s.real.out)));
+      h.push(row('缓存读 / 写 · 推理', fmtTok(s.real.cr) + ' / ' + fmtTok(s.real.cw) + ' · ' + fmtTok(s.real.rz)));
+      h.push(row('缓存命中率（真实）', hitR === null ? '—' : hitR.toFixed(0) + '%'));
+      var sec = sessionSeconds(s);
+      h.push(row('会话时长 / 平均 TPS', (sec === null ? '—' : fmtSec(sec * 1000)) + ' · ' +
+        (officialAvgTps(s) === null ? '—' : fmtSpeed(officialAvgTps(s)) + ' tok/s')));
+      h.push(row('消息 / 工具调用', (s.real.msgs || '—') + ' / ' + (s.real.tools || '—')));
+      if (s.real.model) h.push(row('模型', s.real.model));
+      h.push(row('数据更新于', new Date(s.real.at).toLocaleTimeString()));
+    } else {
+      h.push(row('状态', s.real.err ? ('未接入（' + s.real.err + '）') : '首次读取中…'));
+      h.push('<div class="tokps-sub" style="margin-top:2px">读 /api/studio/sessions/:id，未登录或接口变化时会一直显示未接入；此时仍用事件流统计。</div>');
+    }
+
+    h.push('<hr><h4>Token 明细（事件流统计）</h4>');
     h.push(row('输入 / 输出', fmtTok(s.cumIn) + ' / ' + fmtTok(s.cumOut)));
     h.push(row('缓存读 / 缓存写', fmtTok(s.cumCacheRead) + ' / ' + fmtTok(s.cumCacheWrite)));
     h.push(row('推理 token', fmtTok(s.cumReasoning)));
@@ -874,7 +978,12 @@
   } catch (e) { log('transport hook failed', e); }
 
   window.__tokps = { handle: handle, feed: feedSocketText, paint: paint, state: sessions, stats: stats,
-    debug: function () { return { stats: stats, diag: DIAG, sessions: Object.keys(sessions) }; }, version: '3.3.1' };
+    applySession: function (sidOrObj, payload) {
+      var s = (sidOrObj && typeof sidOrObj === 'object') ? sidOrObj : sess(sidOrObj);
+      return applySessionPayload(s, payload);
+    },
+    officialAvg: officialAvgTps, realTurn: realTurnSpeed, sessionSeconds: sessionSeconds,
+    debug: function () { return { stats: stats, diag: DIAG, sessions: Object.keys(sessions) }; }, version: '3.4.0' };
 
   /* 挂载兜底：脚本在 head 里执行时 body 还没出来，等 body 可用了再挂浮标 */
   var bootTimer = setInterval(function () {
