@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.log
+.DS_Store
+index.html.tokps.bak
+node_modules/
