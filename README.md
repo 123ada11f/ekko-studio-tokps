@@ -109,6 +109,19 @@ CI（`.github/workflows/ci.yml`）跑上面这些语法检查与解析测试。
 - 估算值受文本构成影响（中英混排、代码块），读数以面板里的「实测速度」为准。
 - 不要用它去改别人产品的付费/鉴权逻辑 —— 这里只做「本地显示增强」。
 
+
+## 上游进展（Upstream）
+
+- **Issue #3178**（open）：聊天界面缺 tok/s 与缓存命中率，官方桌面端状态栏已有、来源是 TUI 网关的 `avg_tps` / `cache_hit_pct`。
+  我们在该 issue 下贴了本项目的思路与实测到的协议细节：
+  https://github.com/EKKOLearnAI/ekko-studio/issues/3178#issuecomment-5892455675
+- **PR #3227**（open，MERGEABLE）：把社区 PR **#2713**（作者 @monikalnbo，自 2026-08-23 起 CONFLICTING）基于当前 `main` 重新变基，
+  保留原作者署名，并修掉两处无法构建的问题（`ChatInput.vue` props 冲突取并集；移除引用不存在导出的 `noteRunStart(sid)` 调用）。
+  改动仍为纯新增 `+180/-0`、15 文件。
+  https://github.com/EKKOLearnAI/ekko-studio/pull/3227
+
+本仓库是**不依赖上游合并、现在就能用**的补丁版本；上面那个 PR 是"做进产品里"的路径。两者可以并存。
+
 ## License
 
 MIT，见 [LICENSE](LICENSE)。
